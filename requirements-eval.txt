@@ -1,0 +1,5 @@
+# Separate environment for OpenAI guided-diffusion evaluation.
+tensorflow[and-cuda]
+scipy
+requests
+tqdm

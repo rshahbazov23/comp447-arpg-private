@@ -179,3 +179,10 @@ cython_debug/
 *.npy
 *.pt
 *.ipynb
+
+# ARPG baseline reproduction assets
+external/
+weights/
+eval/
+samples/
+results/

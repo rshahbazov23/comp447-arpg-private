@@ -1,0 +1,6 @@
+# Install CUDA-enabled PyTorch separately via conda or the official wheel first.
+transformers>=4.32
+einops>=0.8
+Pillow>=9.0
+tqdm>=4.65
+numpy>=1.24

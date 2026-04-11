@@ -36,6 +36,16 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     return npz_path
 
 
+def build_class_schedule(num_samples, num_classes):
+    """
+    Build enough class labels for the padded sampling count and shard them in
+    filename order so multi-GPU runs keep valid labels for every saved image.
+    """
+    repeats = math.ceil(num_samples / num_classes)
+    classes = np.tile(np.arange(num_classes, dtype=np.int64), repeats)
+    return classes[:num_samples]
+
+
 def main(args):
     # Setup PyTorch:
     assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
@@ -120,9 +130,9 @@ def main(args):
     pbar = tqdm(pbar) if rank == 0 else pbar
     total = 0
 
-    all_classes = list(range(1000)) * (args.num_fid_samples // 1000)
-    subset_len = len(all_classes) // dist.get_world_size()
-    all_classes = np.array(all_classes[rank * subset_len: (rank+1)*subset_len], dtype=np.int64)
+    all_classes = build_class_schedule(total_samples, args.num_classes)
+    all_classes = all_classes[rank::dist.get_world_size()]
+    assert len(all_classes) == samples_needed_this_gpu, "rank-local class schedule does not match sample count"
     
     cur_idx = 0
     for _ in pbar:
@@ -161,7 +171,9 @@ if __name__ == "__main__":
     parser.add_argument("--from-fsdp", action='store_true')
     parser.add_argument("--cls-token-num", type=int, default=1, help="max token number of condition input")
     parser.add_argument("--precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
-    parser.add_argument("--compile", action='store_true', default=True)
+    parser.set_defaults(compile=True)
+    parser.add_argument("--compile", dest="compile", action="store_true", help="enable torch.compile for sampling")
+    parser.add_argument("--no-compile", dest="compile", action="store_false", help="disable torch.compile for sampling")
     parser.add_argument("--vq-model", type=str, choices=list(VQ_models.keys()), default="VQ-16")
     parser.add_argument("--vq-ckpt", type=str, default=None, help="ckpt path for vq model")
     parser.add_argument("--codebook-size", type=int, default=16384, help="codebook size for vector quantization")

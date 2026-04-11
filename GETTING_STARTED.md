@@ -2,6 +2,9 @@
 ### Preparation
 To accelerate the training process, we use the ImageNet dataset that has been pre-encoded into tokens, following the approach of [LlamaGen](https://github.com/FoundationVision/LlamaGen). You can directly download the pre-processed [dataset](https://huggingface.co/ziqipang/RandAR/blob/main/imagenet-llamagen-adm-256_codes.tar) provided by [RandAR](https://github.com/ziqipang/RandAR).
 
+### Reproduction Helpers
+For a repo-supported ARPG-L checkpoint reproduction flow, see [docs/ARPG_L_BASELINE.md](docs/ARPG_L_BASELINE.md). It includes pip requirement files, asset download helpers, smoke/full sampling scripts, and an evaluation wrapper around `guided-diffusion`.
+
 ### Training
 Taking ARPG-L as an example, the script for training using 8 A800-80GB GPUs is as follows:
 ```shell
