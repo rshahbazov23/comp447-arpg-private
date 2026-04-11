@@ -178,7 +178,6 @@ cython_debug/
 *.npz
 *.npy
 *.pt
-*.ipynb
 
 # ARPG baseline reproduction assets
 external/
