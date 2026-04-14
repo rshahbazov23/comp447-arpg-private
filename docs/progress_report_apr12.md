@@ -17,15 +17,23 @@ This is an inference-time modification only -- no retraining or architecture cha
 
 ### 2.1 Codebase Setup
 
-- Cloned the official ARPG repository and set up the reproduction environment
-- Created helper scripts for the full reproduction pipeline:
-  - `scripts/download_baseline_assets.sh` -- downloads ARPG-L checkpoint (320M params), LlamaGen VQ tokenizer, and ImageNet-256 reference batch (~2.5 GB total)
-  - `scripts/run_arpgl_smoke.sh` -- 1k-sample quick sanity check
-  - `scripts/run_arpgl_full.sh` -- full 50k-sample baseline run
-  - `scripts/eval_arpgl_baseline.sh` -- FID evaluation using OpenAI's guided-diffusion evaluator
-  - `scripts/check_repro_env.sh` -- environment verification
-- Created pip requirement files (`requirements-repro.txt`, `requirements-eval.txt`)
-- Set up a Google Colab Pro notebook (`notebooks/arpgl_baseline_colab.ipynb`) with Google Drive integration for persistent storage of weights and results
+The official ARPG repository provides model definitions and a sampling script (`sample_c2i_ddp.py`) but does not include a self-contained reproduction workflow. The README lists raw commands for training and sampling but assumes the user will manually download checkpoints, set up the evaluator, and wire everything together. We built a complete, reproducible pipeline around the existing code so that any team member can go from a fresh clone to a verified FID number in a single session.
+
+**Reproduction scripts.** We created five shell scripts that automate the full workflow:
+
+- `scripts/download_baseline_assets.sh` -- Downloads the three external assets required for evaluation: the ARPG-L pretrained checkpoint (`arpg_300m.pt`, 320M parameters), the LlamaGen VQ tokenizer (`vq_ds16_c2i.pt`) used to decode discrete tokens back into pixel space, and OpenAI's ImageNet-256 reference batch (`VIRTUAL_imagenet256_labeled.npz`) which provides the ground-truth statistics for FID computation. It also clones OpenAI's `guided-diffusion` repository, which contains the standard FID/IS/precision/recall evaluator used by ADM and adopted as the evaluation protocol in the ARPG paper. Total download is approximately 2.5 GB. The script skips files that already exist, making reruns instant.
+
+- `scripts/check_repro_env.sh` -- Verifies that PyTorch can see CUDA and that the ARPG model classes import correctly. This catches environment issues (missing GPU driver, broken dependency) before a long sampling run wastes compute time.
+
+- `scripts/run_arpgl_smoke.sh` -- Generates 1,000 samples (instead of the full 50,000) as a quick sanity check. This takes approximately 8 minutes on a single A100 and verifies the entire sampling pipeline end-to-end: model loading, checkpoint parsing, class-conditional generation with classifier-free guidance, VQ decoding, PNG saving, and NPZ packaging. We use this before every full run to catch configuration errors early.
+
+- `scripts/run_arpgl_full.sh` -- Generates the full 50,000 samples required for FID-50K evaluation. Uses the exact hyperparameters from the ARPG paper: arccos schedule, cfg-scale 5.0, 64 decoding steps, temperature 1.0. All parameters are configurable via environment variables, which will be important when we run experiments with modified decoding in later milestones.
+
+- `scripts/eval_arpgl_baseline.sh` -- Runs the OpenAI guided-diffusion evaluator on the generated NPZ against the ImageNet reference batch. Reports FID, Inception Score, sFID, precision, and recall. The evaluator requires TensorFlow and scipy, which is why we maintain a separate `requirements-eval.txt` to keep the sampling environment clean.
+
+**Dependency management.** We split dependencies into two requirement files because the sampling environment (PyTorch + CUDA) and the evaluation environment (TensorFlow + scipy) can conflict. `requirements-repro.txt` covers the runtime dependencies for model loading and sampling (transformers, einops, Pillow, tqdm, numpy). `requirements-eval.txt` covers the FID evaluator. On Colab, PyTorch and TensorFlow coexist in the same runtime, so this separation is less critical, but it keeps the setup clean for bare-metal Linux machines.
+
+**Colab notebook.** Since our local machines run macOS (no CUDA), we set up a Google Colab Pro notebook (`notebooks/arpgl_baseline_colab.ipynb`) as our primary compute environment. The notebook mounts Google Drive at session start and symlinks the `weights/`, `eval/`, and `external/` directories into the cloned repo. This means the ~2.5 GB of model weights and reference data are downloaded once to Drive and persist across Colab sessions -- reconnecting only requires re-cloning the lightweight repo code (~1 minute) instead of re-downloading everything. Generated results (NPZ files) are also backed up to Drive automatically after sampling completes.
 
 ### 2.2 Code Patches
 
