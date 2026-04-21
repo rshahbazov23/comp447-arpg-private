@@ -150,6 +150,9 @@ def main(args):
     assert len(all_classes) == samples_needed_this_gpu, "rank-local class schedule does not match sample count"
     
     # Single tracker per rank, reused across batches (only rank 0 writes output).
+    # The tracker accumulates aggregate stats (defer_counts, commit steps) over
+    # ALL batches; per-step detail is retained only for the first batch to keep
+    # JSON size manageable on 50k-sample runs.
     tracker = None
     if args.log_json and args.rejection_mode == 'rejection' and rank == 0:
         tracker = RejectionTracker(num_samples=n, seq_len=latent_size * latent_size)
@@ -171,8 +174,8 @@ def main(args):
                 sample_schedule=args.sample_schedule,
             )
         elif args.rejection_mode == 'rejection':
-            # Only wire the tracker on rank 0 for the first batch; avoid concatenating huge logs.
-            batch_tracker = tracker if (tracker is not None and batch_idx == 0) else None
+            if tracker is not None:
+                tracker.begin_batch()
             index_sample = gpt_model.generate_with_rejection(
                 c_indices,
                 guidance_scale=args.cfg_scale,
@@ -183,9 +186,11 @@ def main(args):
                 threshold=args.rejection_threshold,
                 max_reject_rate=args.max_reject_rate,
                 confidence_metric=args.confidence_metric,
-                tracker=batch_tracker,
+                tracker=tracker,
                 debug=args.debug,
             )
+            if tracker is not None:
+                tracker.end_batch()
         elif args.rejection_mode == 'refinement':
             index_sample = gpt_model.generate_with_refinement(
                 c_indices,

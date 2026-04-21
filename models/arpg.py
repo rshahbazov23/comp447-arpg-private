@@ -663,25 +663,32 @@ class Transformer(nn.Module):
             conf_mean = conf.mean(dim=0)      # (num_pred,), per-column decision
 
             # Accept mask — uniform across batch rows to avoid ragged tensors.
+            # Build a single bool tensor then sync ONCE with .item() to get num_accepted.
             if is_final_step:
                 accept_mask_col = torch.ones(num_pred, dtype=torch.bool, device=device)
+                num_accepted = num_pred
             else:
-                accept_mask_col = conf_mean >= threshold
                 min_accept = int(math.ceil((1.0 - max_reject_rate) * num_pred))
-                # Ensure we don't reject more than max_reject_rate fraction.
-                if int(accept_mask_col.sum().item()) < min_accept:
-                    if min_accept >= num_pred:
-                        accept_mask_col = torch.ones(num_pred, dtype=torch.bool, device=device)
-                    else:
+                if min_accept >= num_pred:
+                    # Cap forces every token to be accepted → short-circuit to avoid one sync.
+                    accept_mask_col = torch.ones(num_pred, dtype=torch.bool, device=device)
+                    num_accepted = num_pred
+                else:
+                    accept_mask_col = conf_mean >= threshold
+                    current_accepted = int(accept_mask_col.sum().item())  # single sync point
+                    if current_accepted < min_accept:
+                        # Promote top-confidence rejections until we meet the cap.
                         top_idx = conf_mean.topk(min_accept).indices
                         accept_mask_col = torch.zeros(num_pred, dtype=torch.bool, device=device)
                         accept_mask_col[top_idx] = True
+                        num_accepted = min_accept
+                    else:
+                        num_accepted = current_accepted
 
             probs = F.softmax(logits, dim=-1)
             sampled = torch.multinomial(probs.flatten(0, 1), num_samples=1, generator=generator)
             sampled = sampled.reshape(num_samples, num_pred)
 
-            num_accepted = int(accept_mask_col.sum().item())
             accepted_tokens = sampled[:, accept_mask_col]                    # (N, num_accepted)
             accepted_positions = next_range[accept_mask_col]                 # (num_accepted,)
             deferred_positions = next_range[~accept_mask_col]                # (num_deferred,)
@@ -772,7 +779,7 @@ class Transformer(nn.Module):
         conf_fn = CONFIDENCE_FNS[confidence_metric]
 
         last_pos = 0
-        last_range = range(0, 1)  # match vanilla's hardcoded class token range
+        last_range = torch.arange(0, 1, device=device, dtype=torch.long)  # class token
         sequences = []
         confidences = []  # per-step (N, num_pred) tensors, captured pre-sampling
 
@@ -834,18 +841,21 @@ class Transformer(nn.Module):
 
         # Cache is still alive: we run the refinement pass BEFORE tearing down.
         sequences_cat = torch.cat(sequences, dim=-1)           # (N, seq_len), in commit order
-        confidences_cat = torch.cat(confidences, dim=-1)       # (N, seq_len), in commit order
 
-        num_refine = max(1, int(refinement_k * seq_len))
+        num_refine = int(refinement_k * seq_len)
+        if num_refine <= 0:
+            # No refinement requested → return vanilla output. The ablation
+            # reduces to the main-line generate() result.
+            self.setup_kv_cache(enable=False)
+            return sequences_cat[:, orders.argsort(dim=0)]
+
+        confidences_cat = torch.cat(confidences, dim=-1)       # (N, seq_len), in commit order
         conf_mean = confidences_cat.mean(dim=0)                # (seq_len,), batch-averaged
         bottom_idx = conf_mean.topk(num_refine, largest=False).indices  # indices into commit order
         refinement_positions = orders[bottom_idx]              # spatial positions in [1, seq_len]
 
-        # Final CFG scale — matches vanilla at last_pos = seq_len.
-        if cfg_schedule == 'linear':
-            cfg_scale_refine = 1.0 + (guidance_scale - 1.0) * 1.0
-        else:
-            cfg_scale_refine = guidance_scale
+        # Final CFG scale at last_pos = seq_len: 1.0 + (gs - 1.0) * 1.0 = guidance_scale.
+        cfg_scale_refine = guidance_scale
 
         # Run cross-attention ONLY for the query positions using the full cache.
         # Empty input_ids keeps Pass-1 no-op so the cache doesn't grow.
@@ -866,7 +876,6 @@ class Transformer(nn.Module):
         refined = refined.reshape(num_samples, num_refine)
 
         # Replace bottom-K positions with refined tokens (in commit order).
-        sequences_cat = sequences_cat.clone()
         sequences_cat[:, bottom_idx] = refined
 
         self.setup_kv_cache(enable=False)

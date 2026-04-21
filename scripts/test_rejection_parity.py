@@ -49,14 +49,15 @@ def run_vanilla(model, condition, gen_seed: int, device, **kwargs):
     return model.generate(condition, generator=gen, **kwargs)
 
 
-def run_rejection(model, condition, gen_seed: int, device, threshold, max_reject_rate, **kwargs):
+def run_rejection(model, condition, gen_seed: int, device, threshold, max_reject_rate,
+                  confidence_metric: str = "max_prob", **kwargs):
     gen = torch.Generator(device=device).manual_seed(gen_seed)
     return model.generate_with_rejection(
         condition,
         generator=gen,
         threshold=threshold,
         max_reject_rate=max_reject_rate,
-        confidence_metric="max_prob",
+        confidence_metric=confidence_metric,
         debug=True,
         **kwargs,
     )
@@ -97,22 +98,28 @@ def main():
 
     # ----------------------------------------------------------------------
     # Checkpoint 1: Parity — threshold=0, max_reject=0 must match vanilla.
+    # Run for each confidence metric. For max_prob and margin, all
+    # confidences >= 0 so the direct mask path is taken. For entropy,
+    # confidences are negative so the min_accept escape hatch is taken.
+    # Both paths must end up with the same tokens when max_reject_rate=0.
     # ----------------------------------------------------------------------
-    print("\n[1/4] Parity test (threshold=0, max_reject_rate=0) ...")
+    print("\n[1/4] Parity test (threshold=0, max_reject_rate=0) across metrics ...")
     out_vanilla = run_vanilla(model, condition, args.order_seed, device, **common_kwargs)
-    out_rej_zero = run_rejection(
-        model, condition, args.order_seed, device,
-        threshold=0.0, max_reject_rate=0.0, **common_kwargs,
-    )
-    if torch.equal(out_vanilla, out_rej_zero):
-        print("  PASS: outputs are bit-identical")
-    else:
-        diff = (out_vanilla != out_rej_zero).sum().item()
-        total = out_vanilla.numel()
-        print(f"  FAIL: {diff}/{total} positions differ")
-        print(f"  first 10 diffs at indices: "
-              f"{(out_vanilla != out_rej_zero).nonzero()[:10].tolist()}")
-        sys.exit(1)
+    for metric in ("max_prob", "entropy", "margin"):
+        out_rej_zero = run_rejection(
+            model, condition, args.order_seed, device,
+            threshold=0.0, max_reject_rate=0.0,
+            confidence_metric=metric, **common_kwargs,
+        )
+        if torch.equal(out_vanilla, out_rej_zero):
+            print(f"  PASS ({metric}): outputs are bit-identical")
+        else:
+            diff = (out_vanilla != out_rej_zero).sum().item()
+            total = out_vanilla.numel()
+            print(f"  FAIL ({metric}): {diff}/{total} positions differ")
+            print(f"  first 10 diffs at indices: "
+                  f"{(out_vanilla != out_rej_zero).nonzero()[:10].tolist()}")
+            sys.exit(1)
 
     # ----------------------------------------------------------------------
     # Checkpoint 2: Determinism — two rejection runs with same generator match.

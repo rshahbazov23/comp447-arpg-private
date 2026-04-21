@@ -22,6 +22,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 THRESHOLD="${THRESHOLD:-0.5}"
 MAX_REJECT_RATE="${MAX_REJECT_RATE:-0.2}"
 CONFIDENCE_METRIC="${CONFIDENCE_METRIC:-max_prob}"
+GLOBAL_SEED="${GLOBAL_SEED:-0}"
 
 if [[ ! -f "$GPT_CKPT" ]]; then
     echo "Missing checkpoint: $GPT_CKPT" >&2
@@ -44,6 +45,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" sample_c2i_d
     --num-fid-samples 16 \
     --per-proc-batch-size 16 \
     --sample-dir "$SAMPLE_DIR" \
+    --global-seed "$GLOBAL_SEED" \
     --no-compile \
     --rejection-mode rejection \
     --confidence-metric "$CONFIDENCE_METRIC" \
