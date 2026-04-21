@@ -462,16 +462,20 @@ class Transformer(nn.Module):
         top_p=1,
         seq_len=256,
         num_iter=64,
+        generator: Optional[torch.Generator] = None,
     ):
         device = condition.device
         num_samples = condition.shape[0]
         freqs_cis_ = self.freqs_cis.unsqueeze(0).to(device)
-        
+
         # shift condition id
         condition = self.preprocess_condition(condition, cond_drop_prob=0.0)
 
         # generate a random order
-        orders = torch.rand(seq_len, device=device).argsort(dim=0) + 1
+        if generator is not None:
+            orders = torch.rand(seq_len, device=device, generator=generator).argsort(dim=0) + 1
+        else:
+            orders = torch.rand(seq_len, device=device).argsort(dim=0) + 1
 
         last_pos = 0
         last_range = range(0, 1)  # for class token, hardcode
@@ -531,18 +535,355 @@ class Transformer(nn.Module):
                 logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
             
             probs = F.softmax(logits, dim=-1)
-            sampled = torch.multinomial(probs.flatten(0, 1), num_samples=1)
+            sampled = torch.multinomial(probs.flatten(0, 1), num_samples=1, generator=generator)
             sequences.append(sampled.reshape(num_samples, -1))
-            
+
             last_range = next_range
-            
+
         self.setup_kv_cache(enable=False)
 
         sequences = torch.cat(sequences, dim=-1)
         return sequences[:, orders.argsort(dim=0)]
 
+    @torch.inference_mode()
+    def generate_with_rejection(
+        self,
+        condition,
+        guidance_scale=4.0,
+        cfg_schedule='linear',
+        sample_schedule='arccos',
+        temperature=1.0,
+        top_k=0,
+        top_p=1,
+        seq_len=256,
+        num_iter=64,
+        threshold: float = 0.5,
+        max_reject_rate: float = 0.2,
+        confidence_metric: str = 'max_prob',
+        tracker=None,
+        generator: Optional[torch.Generator] = None,
+        debug: bool = False,
+    ):
+        """Confidence-guided token rejection variant of generate().
 
-# https://github.com/pytorch-labs/gpt-fast/blob/main/model.py 
+        After each parallel step, score each predicted token's confidence. Tokens
+        below `threshold` are deferred (not committed to the KV cache) and get
+        re-attempted in a later step with more context. The `max_reject_rate`
+        parameter caps rejections per step.
+
+        Threshold=0 with max_reject_rate=0 must produce output IDENTICAL to
+        generate() with the same generator (parity test).
+
+        Notes on correctness:
+        - Single forward per step is sufficient. The KV cache grows via input_ids
+          from Pass-1 processing, which are ALREADY only the accepted tokens from
+          the previous step. Queries in Pass-2 don't affect the cache. So the
+          cache is correct by construction without double-forward.
+        - The arccos schedule is left unmodified (proposal §2). Deferred tokens
+          naturally consume capacity from future steps because `num_pred =
+          seq_len - last_pos - mask_len` grows when `last_pos` is smaller.
+        """
+        from models.confidence import CONFIDENCE_FNS
+
+        device = condition.device
+        num_samples = condition.shape[0]
+        freqs_cis_ = self.freqs_cis.unsqueeze(0).to(device)
+
+        condition = self.preprocess_condition(condition, cond_drop_prob=0.0)
+
+        if generator is not None:
+            orders = torch.rand(seq_len, device=device, generator=generator).argsort(dim=0) + 1
+        else:
+            orders = torch.rand(seq_len, device=device).argsort(dim=0) + 1
+
+        if confidence_metric not in CONFIDENCE_FNS:
+            raise ValueError(f"unknown confidence_metric: {confidence_metric}")
+        conf_fn = CONFIDENCE_FNS[confidence_metric]
+
+        last_pos = 0
+        last_range = torch.arange(0, 1, device=device, dtype=torch.long)  # class token
+        sequences = []
+
+        self.setup_kv_cache(enable=True)
+        for step in range(num_iter):
+            if tracker is not None:
+                tracker.step_begin()
+
+            # Arccos / cosine schedule — UNCHANGED per proposal requirement.
+            if sample_schedule == 'arccos':
+                mask_ratio = np.arccos(1. * (step + 1) / num_iter) / (math.pi * 0.5)
+            elif sample_schedule == 'cosine':
+                mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
+            else:
+                raise NotImplementedError
+
+            mask_len = int(seq_len * mask_ratio)
+            mask_len = max(1, min(seq_len - last_pos - 1, mask_len))
+
+            num_pred = seq_len - last_pos - mask_len
+            is_final_step = (step == num_iter - 1)
+            if is_final_step:
+                num_pred = seq_len - last_pos
+
+            next_range = orders[last_pos:last_pos + num_pred]
+
+            # Tentative CFG scale — matches vanilla (count attempts this step).
+            tentative_last_pos = last_pos + num_pred
+            if cfg_schedule == 'linear':
+                cfg_scale = 1.0 + (guidance_scale - 1.0) * tentative_last_pos / seq_len
+            elif cfg_schedule == 'constant':
+                cfg_scale = guidance_scale
+            else:
+                raise NotImplementedError
+
+            freqs_cis = torch.cat([
+                freqs_cis_[:, last_range, ...],
+                freqs_cis_[:, next_range, ...]
+            ], dim=1)
+
+            if guidance_scale != 0:
+                if step == 0:
+                    input_ids = torch.cat([condition, torch.full_like(condition, self.none_conds_id)], dim=0)
+                else:
+                    input_ids = torch.cat([sequences[-1], sequences[-1]], dim=0)
+
+                logits = self.forward_shared(input_ids, freqs_cis, num_pred)
+                cond_logits, uncond_logits = logits[:num_samples], logits[num_samples:]
+                logits = uncond_logits + (cond_logits - uncond_logits) * cfg_scale
+            else:
+                raise NotImplementedError
+
+            logits = logits[:, -num_pred:] / max(temperature, 1e-5)
+
+            if top_k > 0 or top_p < 1.0:
+                logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+
+            # Confidence scoring (post temperature + top-k/p filtering).
+            conf = conf_fn(logits)            # (N, num_pred)
+            conf_mean = conf.mean(dim=0)      # (num_pred,), per-column decision
+
+            # Accept mask — uniform across batch rows to avoid ragged tensors.
+            # Build a single bool tensor then sync ONCE with .item() to get num_accepted.
+            if is_final_step:
+                accept_mask_col = torch.ones(num_pred, dtype=torch.bool, device=device)
+                num_accepted = num_pred
+            else:
+                min_accept = int(math.ceil((1.0 - max_reject_rate) * num_pred))
+                if min_accept >= num_pred:
+                    # Cap forces every token to be accepted → short-circuit to avoid one sync.
+                    accept_mask_col = torch.ones(num_pred, dtype=torch.bool, device=device)
+                    num_accepted = num_pred
+                else:
+                    accept_mask_col = conf_mean >= threshold
+                    current_accepted = int(accept_mask_col.sum().item())  # single sync point
+                    if current_accepted < min_accept:
+                        # Promote top-confidence rejections until we meet the cap.
+                        top_idx = conf_mean.topk(min_accept).indices
+                        accept_mask_col = torch.zeros(num_pred, dtype=torch.bool, device=device)
+                        accept_mask_col[top_idx] = True
+                        num_accepted = min_accept
+                    else:
+                        num_accepted = current_accepted
+
+            probs = F.softmax(logits, dim=-1)
+            sampled = torch.multinomial(probs.flatten(0, 1), num_samples=1, generator=generator)
+            sampled = sampled.reshape(num_samples, num_pred)
+
+            accepted_tokens = sampled[:, accept_mask_col]                    # (N, num_accepted)
+            accepted_positions = next_range[accept_mask_col]                 # (num_accepted,)
+            deferred_positions = next_range[~accept_mask_col]                # (num_deferred,)
+
+            # Reinsert deferred positions right after the accepted block so they
+            # are re-attempted starting next step. Tail remains untouched.
+            tail = orders[last_pos + num_pred:]
+            orders = torch.cat([orders[:last_pos], accepted_positions, deferred_positions, tail])
+
+            if tracker is not None:
+                tracker.log_step(step, next_range, accept_mask_col, conf_mean)
+
+            if debug:
+                assert accepted_positions.numel() + deferred_positions.numel() == num_pred
+                assert orders.numel() == seq_len
+                if is_final_step:
+                    assert num_accepted == num_pred, "final step must accept all"
+
+            # Only accepted tokens become input to the next step's Pass-1 → cache.
+            if num_accepted == 0:
+                # Must never happen because of max_reject_rate cap and final-step
+                # override. Guard as a hard failure.
+                raise RuntimeError(
+                    f"step {step}: zero tokens accepted; cache cannot progress. "
+                    f"Check threshold={threshold} and max_reject_rate={max_reject_rate}."
+                )
+
+            sequences.append(accepted_tokens)
+            last_range = accepted_positions
+            last_pos += num_accepted
+
+        self.setup_kv_cache(enable=False)
+
+        if debug:
+            assert last_pos == seq_len, f"not all positions committed: {last_pos}/{seq_len}"
+
+        sequences_cat = torch.cat(sequences, dim=-1)
+        if debug:
+            assert sequences_cat.shape[-1] == seq_len, (
+                f"expected {seq_len} tokens, got {sequences_cat.shape[-1]}"
+            )
+            # Every spatial position in [1, seq_len] appears exactly once in orders.
+            unique_positions = torch.unique(orders)
+            assert unique_positions.numel() == seq_len, (
+                f"orders should contain {seq_len} unique positions, got {unique_positions.numel()}"
+            )
+
+        return sequences_cat[:, orders.argsort(dim=0)]
+
+    @torch.inference_mode()
+    def generate_with_refinement(
+        self,
+        condition,
+        guidance_scale=4.0,
+        cfg_schedule='linear',
+        sample_schedule='arccos',
+        temperature=1.0,
+        top_k=0,
+        top_p=1,
+        seq_len=256,
+        num_iter=64,
+        refinement_k: float = 0.1,
+        confidence_metric: str = 'max_prob',
+        generator: Optional[torch.Generator] = None,
+    ):
+        """Ablation: run vanilla generate(), then re-decode the K% lowest-confidence
+        tokens in a single refinement pass using the full KV cache.
+
+        Tests whether the benefit (if any) of the main rejection method comes from
+        preventing error propagation during generation, or whether post-hoc
+        correction is equally effective.
+        """
+        from models.confidence import CONFIDENCE_FNS
+
+        device = condition.device
+        num_samples = condition.shape[0]
+        freqs_cis_ = self.freqs_cis.unsqueeze(0).to(device)
+
+        condition = self.preprocess_condition(condition, cond_drop_prob=0.0)
+
+        if generator is not None:
+            orders = torch.rand(seq_len, device=device, generator=generator).argsort(dim=0) + 1
+        else:
+            orders = torch.rand(seq_len, device=device).argsort(dim=0) + 1
+
+        if confidence_metric not in CONFIDENCE_FNS:
+            raise ValueError(f"unknown confidence_metric: {confidence_metric}")
+        conf_fn = CONFIDENCE_FNS[confidence_metric]
+
+        last_pos = 0
+        last_range = torch.arange(0, 1, device=device, dtype=torch.long)  # class token
+        sequences = []
+        confidences = []  # per-step (N, num_pred) tensors, captured pre-sampling
+
+        self.setup_kv_cache(enable=True)
+        for step in range(num_iter):
+            if sample_schedule == 'arccos':
+                mask_ratio = np.arccos(1. * (step + 1) / num_iter) / (math.pi * 0.5)
+            elif sample_schedule == 'cosine':
+                mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
+            else:
+                raise NotImplementedError
+
+            mask_len = int(seq_len * mask_ratio)
+            mask_len = max(1, min(seq_len - last_pos - 1, mask_len))
+
+            num_pred = seq_len - last_pos - mask_len
+            if step == num_iter - 1:
+                num_pred = seq_len - last_pos
+
+            next_range = orders[range(last_pos, last_pos + num_pred)]
+            last_pos += num_pred
+
+            if cfg_schedule == 'linear':
+                cfg_scale = 1.0 + (guidance_scale - 1.0) * last_pos / seq_len
+            elif cfg_schedule == 'constant':
+                cfg_scale = guidance_scale
+            else:
+                raise NotImplementedError
+
+            freqs_cis = torch.cat([
+                freqs_cis_[:, last_range, ...],
+                freqs_cis_[:, next_range, ...]
+            ], dim=1)
+
+            if guidance_scale != 0:
+                if step == 0:
+                    input_ids = torch.cat([condition, torch.full_like(condition, self.none_conds_id)], dim=0)
+                else:
+                    input_ids = torch.cat([sequences[-1], sequences[-1]], dim=0)
+
+                logits = self.forward_shared(input_ids, freqs_cis, num_pred)
+                cond_logits, uncond_logits = logits[:num_samples], logits[num_samples:]
+                logits = uncond_logits + (cond_logits - uncond_logits) * cfg_scale
+            else:
+                raise NotImplementedError
+
+            logits = logits[:, -num_pred:] / max(temperature, 1e-5)
+
+            if top_k > 0 or top_p < 1.0:
+                logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+
+            confidences.append(conf_fn(logits))
+
+            probs = F.softmax(logits, dim=-1)
+            sampled = torch.multinomial(probs.flatten(0, 1), num_samples=1, generator=generator)
+            sequences.append(sampled.reshape(num_samples, -1))
+
+            last_range = next_range
+
+        # Cache is still alive: we run the refinement pass BEFORE tearing down.
+        sequences_cat = torch.cat(sequences, dim=-1)           # (N, seq_len), in commit order
+
+        num_refine = int(refinement_k * seq_len)
+        if num_refine <= 0:
+            # No refinement requested → return vanilla output. The ablation
+            # reduces to the main-line generate() result.
+            self.setup_kv_cache(enable=False)
+            return sequences_cat[:, orders.argsort(dim=0)]
+
+        confidences_cat = torch.cat(confidences, dim=-1)       # (N, seq_len), in commit order
+        conf_mean = confidences_cat.mean(dim=0)                # (seq_len,), batch-averaged
+        bottom_idx = conf_mean.topk(num_refine, largest=False).indices  # indices into commit order
+        refinement_positions = orders[bottom_idx]              # spatial positions in [1, seq_len]
+
+        # Final CFG scale at last_pos = seq_len: 1.0 + (gs - 1.0) * 1.0 = guidance_scale.
+        cfg_scale_refine = guidance_scale
+
+        # Run cross-attention ONLY for the query positions using the full cache.
+        # Empty input_ids keeps Pass-1 no-op so the cache doesn't grow.
+        freqs_cis_refine = freqs_cis_[:, refinement_positions, ...]
+        empty_ids = torch.empty(
+            (2 * num_samples, 0), dtype=torch.long, device=device
+        )
+        logits_refine = self.forward_shared(empty_ids, freqs_cis_refine, num_refine)
+        cond_l, uncond_l = logits_refine[:num_samples], logits_refine[num_samples:]
+        logits_refine = uncond_l + (cond_l - uncond_l) * cfg_scale_refine
+        logits_refine = logits_refine[:, -num_refine:] / max(temperature, 1e-5)
+
+        if top_k > 0 or top_p < 1.0:
+            logits_refine = top_k_top_p_filtering(logits_refine, top_k=top_k, top_p=top_p)
+
+        probs_refine = F.softmax(logits_refine, dim=-1)
+        refined = torch.multinomial(probs_refine.flatten(0, 1), num_samples=1, generator=generator)
+        refined = refined.reshape(num_samples, num_refine)
+
+        # Replace bottom-K positions with refined tokens (in commit order).
+        sequences_cat[:, bottom_idx] = refined
+
+        self.setup_kv_cache(enable=False)
+
+        return sequences_cat[:, orders.argsort(dim=0)]
+
+
+# https://github.com/pytorch-labs/gpt-fast/blob/main/model.py
 def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000, cls_token_num=120):
     freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem))
     t = torch.arange(seq_len, device=freqs.device)
