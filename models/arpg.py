@@ -913,6 +913,12 @@ def precompute_freqs_cis_2d(grid_size: int, n_elem: int, base: int = 10000, cls_
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
     # x: (bs, seq_len, n_head, head_dim)
     # freqs_cis (seq_len, head_dim // 2, 2)
+    if x.shape[1] == 0:
+        # RoPE on a 0-length sequence is a no-op. The reshape below would fail
+        # because the unspecified dim -1 is ambiguous when the tensor is empty.
+        # This path is hit by generate_with_refinement, which calls forward_shared
+        # with empty input_ids so Pass-1 doesn't grow the cache.
+        return x
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2) # (bs, seq_len, n_head, head_dim//2, 2)
     freqs_cis = freqs_cis.view(-1, xshaped.size(1), 1, xshaped.size(3), 2) # (1, seq_len, 1, head_dim//2, 2)
     x_out2 = torch.stack([
