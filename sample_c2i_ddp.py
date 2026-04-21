@@ -17,6 +17,7 @@ import argparse
 
 from models.arpg import ARPG_models
 from models.vq_model import VQ_models
+from utils.rejection_tracker import RejectionTracker
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -50,6 +51,11 @@ def main(args):
     # Setup PyTorch:
     assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
     torch.set_grad_enabled(False)
+
+    # Rejection modes use dynamic shapes / variable per-step logic that torch.compile cannot trace.
+    if args.rejection_mode != 'none' and args.compile:
+        print(f"Disabling torch.compile because --rejection-mode={args.rejection_mode} uses dynamic shapes.")
+        args.compile = False
 
     # Setup DDP:
     dist.init_process_group("nccl")
@@ -109,6 +115,15 @@ def main(args):
                   f"topk-{args.top_k}-topp-{args.top_p}-temperature-{args.temperature}-" \
                   f"cfg-{args.cfg_scale}-cfg-schedule-{args.cfg_schedule}-" \
                   f"sample-schedule-{args.sample_schedule}-step-{args.step}-seed-{args.global_seed}"
+    if args.rejection_mode == 'rejection':
+        folder_name += (
+            f"-mode-rejection-metric-{args.confidence_metric}"
+            f"-tau-{args.rejection_threshold}-cap-{args.max_reject_rate}"
+        )
+    elif args.rejection_mode == 'refinement':
+        folder_name += (
+            f"-mode-refinement-metric-{args.confidence_metric}-k-{args.refinement_k}"
+        )
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
     if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
@@ -134,14 +149,56 @@ def main(args):
     all_classes = all_classes[rank::dist.get_world_size()]
     assert len(all_classes) == samples_needed_this_gpu, "rank-local class schedule does not match sample count"
     
+    # Single tracker per rank, reused across batches (only rank 0 writes output).
+    tracker = None
+    if args.log_json and args.rejection_mode == 'rejection' and rank == 0:
+        tracker = RejectionTracker(num_samples=n, seq_len=latent_size * latent_size)
+
     cur_idx = 0
-    for _ in pbar:
+    for batch_idx, _ in enumerate(pbar):
         # Sample inputs:
         c_indices = torch.from_numpy(all_classes[cur_idx * n: (cur_idx+1)*n]).to(device)
         cur_idx += 1
         qzshape = [len(c_indices), latent_size, latent_size, 256]
 
-        index_sample = gpt_model.generate(c_indices, guidance_scale=args.cfg_scale, temperature=args.temperature, num_iter=args.step, cfg_schedule=args.cfg_schedule, sample_schedule=args.sample_schedule)
+        if args.rejection_mode == 'none':
+            index_sample = gpt_model.generate(
+                c_indices,
+                guidance_scale=args.cfg_scale,
+                temperature=args.temperature,
+                num_iter=args.step,
+                cfg_schedule=args.cfg_schedule,
+                sample_schedule=args.sample_schedule,
+            )
+        elif args.rejection_mode == 'rejection':
+            # Only wire the tracker on rank 0 for the first batch; avoid concatenating huge logs.
+            batch_tracker = tracker if (tracker is not None and batch_idx == 0) else None
+            index_sample = gpt_model.generate_with_rejection(
+                c_indices,
+                guidance_scale=args.cfg_scale,
+                temperature=args.temperature,
+                num_iter=args.step,
+                cfg_schedule=args.cfg_schedule,
+                sample_schedule=args.sample_schedule,
+                threshold=args.rejection_threshold,
+                max_reject_rate=args.max_reject_rate,
+                confidence_metric=args.confidence_metric,
+                tracker=batch_tracker,
+                debug=args.debug,
+            )
+        elif args.rejection_mode == 'refinement':
+            index_sample = gpt_model.generate_with_refinement(
+                c_indices,
+                guidance_scale=args.cfg_scale,
+                temperature=args.temperature,
+                num_iter=args.step,
+                cfg_schedule=args.cfg_schedule,
+                sample_schedule=args.sample_schedule,
+                refinement_k=args.refinement_k,
+                confidence_metric=args.confidence_metric,
+            )
+        else:
+            raise ValueError(f"unknown rejection_mode: {args.rejection_mode}")
 
         samples = vq_model.decode_code(index_sample.clone(), shape=(index_sample.shape[0], 8, 16, 16)) # output value is between [-1, 1]
         if args.image_size_eval != args.image_size:
@@ -158,6 +215,16 @@ def main(args):
     dist.barrier()
     if rank == 0:
         create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
+        if tracker is not None:
+            tracker.finalize()
+            tracker.save_json(args.log_json)
+            heatmap_path = os.path.splitext(args.log_json)[0] + "_heatmap.png"
+            try:
+                tracker.make_heatmap(heatmap_path, grid_size=latent_size)
+                print(f"Saved rejection heatmap to {heatmap_path}")
+            except Exception as e:
+                print(f"Failed to save heatmap: {e}")
+            print(f"Saved rejection log to {args.log_json}")
         print("Done.")
     dist.barrier()
     dist.destroy_process_group()
@@ -194,5 +261,23 @@ if __name__ == "__main__":
     parser.add_argument("--step", type=int, default=256, help="top-k value to sample with")
     parser.add_argument("--cfg-schedule", type=str, default='linear', choices=['linear', 'constant'], help="top-k value to sample with")
     parser.add_argument("--sample-schedule", type=str, default='arccos', choices=['arccos', 'cosine'], help="top-k value to sample with")
+
+    # Confidence-guided rejection (COMP547 project extension)
+    parser.add_argument("--rejection-mode", type=str, default='none',
+                        choices=['none', 'rejection', 'refinement'],
+                        help="'none' = vanilla ARPG; 'rejection' = defer low-confidence tokens; 'refinement' = post-hoc re-decode ablation")
+    parser.add_argument("--confidence-metric", type=str, default='max_prob',
+                        choices=['max_prob', 'entropy', 'margin'])
+    parser.add_argument("--rejection-threshold", type=float, default=0.5,
+                        help="tau: tokens with confidence below this are deferred (pilot grid: {0.3, 0.5, 0.7})")
+    parser.add_argument("--max-reject-rate", type=float, default=0.2,
+                        help="max fraction of tokens that can be deferred per step (pilot grid: {0.1, 0.2})")
+    parser.add_argument("--refinement-k", type=float, default=0.1,
+                        help="fraction of lowest-confidence tokens to re-decode (ablation grid: {0.1, 0.2})")
+    parser.add_argument("--debug", action='store_true',
+                        help="enable runtime invariant assertions in rejection mode")
+    parser.add_argument("--log-json", type=str, default=None,
+                        help="rank-0 rejection log path (JSON). Heatmap saved beside it.")
+
     args = parser.parse_args()
     main(args)
