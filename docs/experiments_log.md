@@ -141,39 +141,119 @@ The refinement ablation gives a clean secondary finding: intervention has to hap
 
 ---
 
-## Phase 2 — 16-Step Expansion Sweep *(PENDING)*
+## Phase 2 — 16-Step Expansion Sweep
 
-**Target date:** Start April 24–25, 2026
-**Purpose:** Confirm the 16-step signal is robust, find the best 16-step config, and prepare for FID-50K validation.
+**Date completed:** April 25, 2026
+**Compute used:** ~4 hours on A100 (sampling) + ~90 min (FID eval) = ~5.5 hours total
+**Configs run:** 22 (block A + B + C all completed, including aggressive 8/12-step block)
 
-### Planned configurations
+### Setup
 
-| Block | Description | # configs |
-|-------|-------------|-----------|
-| A | max_prob grid: τ ∈ {0.3, 0.5, 0.7} × cap ∈ {0.1, 0.2, 0.3, 0.5} at 16 steps (minus the already-done τ=0.5, cap=0.2) | 11 |
-| B | Other metrics at 16 steps, τ=0.5, cap ∈ {0.1, 0.2, 0.5}: entropy (3) + margin (3) | 6 |
-| C (optional) | Ultra-aggressive: vanilla + max_prob+τ=0.5+cap=0.2 at 8 and 12 steps | 4 |
+- 10,000 samples per config (FID-10K)
+- Same arccos schedule, CFG 5.0, temperature 1.0, seed 0 as previous phases
 
-Total: 17 configs (21 with the optional ultra-aggressive block).
+### Block A results — max_prob (τ × cap) grid at 16 steps
 
-**Script:** `scripts/run_16step_sweep.sh`
-**Notebook:** `notebooks/16step_sweep_colab.ipynb`
+| FID-10K | cap=0.1 | cap=0.2 | cap=0.3 | cap=0.5 |
+|---------|---------|---------|---------|---------|
+| τ=0.3 | 5.917 | 5.788 | 5.583 | **5.451** |
+| τ=0.5 | 5.917 | 5.788 | 5.583 | **5.451** |
+| τ=0.7 | 5.917 | 5.788 | 5.584 | **5.451** |
 
-### Expected deliverables
+Δ vs vanilla (FID 6.212):
 
-1. Best 16-step config identified (winner by FID-10K).
-2. Evidence the 16-step effect is robust across metrics/τ/cap (not an artefact of one lucky config).
-3. Expected trend: effect may strengthen at 8–12 steps (if ultra-aggressive block is run).
-4. Winning config → FID-50K validation → progress report headline number.
+| Δ | cap=0.1 | cap=0.2 | cap=0.3 | cap=0.5 |
+|---|---------|---------|---------|---------|
+| τ=0.3 | −0.296 | −0.424 | −0.629 | **−0.762** |
+| τ=0.5 | −0.296 | −0.424 | −0.629 | **−0.762** |
+| τ=0.7 | −0.296 | −0.424 | −0.629 | **−0.762** |
+
+**Findings:**
+
+1. **τ has zero effect** — the table is *literally identical* across τ rows (deviations of ≤0.001 are within FID estimator stochasticity). The cap is binding everywhere, even at cap=0.5. This means at 16 steps, ARPG is uncertain about more than half of its parallel predictions every step.
+2. **Cap is the dominant lever** — FID improves monotonically with cap, from 5.917 (cap=0.1) to 5.451 (cap=0.5). Linear trend.
+3. **No diminishing returns visible up to cap=0.5** — running cap > 0.5 might continue to improve quality (open question for follow-up).
+
+### Block B results — Metric comparison at 16 steps, τ=0.5
+
+| Metric | cap=0.1 | cap=0.2 | cap=0.5 | Best Δ vs vanilla |
+|--------|---------|---------|---------|--------------------|
+| max_prob | 5.917 | 5.788 | 5.451 | −0.762 |
+| entropy | 5.966 | 5.803 | 5.709 | −0.503 |
+| **margin** | 5.923 | 5.781 | **5.424** | **−0.789** ⬅ |
+
+**Findings:**
+
+1. **The metric ranking changes with cap.** At low cap, max_prob and margin are roughly tied (both better than entropy). At cap=0.5, **margin pulls ahead** as the absolute winner. Entropy is consistently the weakest metric.
+2. **The single best config is `margin × τ=0.5 × cap=0.5` → FID 5.424 (−12.69%)**. This becomes the candidate for FID-50K validation.
+
+### Block C results — Step-count sensitivity (max_prob, τ=0.5, cap=0.2)
+
+| Steps | Vanilla FID-10K | Rejection FID-10K | Δ |
+|-------|------------------|--------------------|---|
+| 8 | 13.357 | 11.011 | **−2.346 (−17.6%)** |
+| 12 | 8.120 | 7.161 | **−0.959 (−11.8%)** |
+| 16 | 6.212 | 5.788 | −0.424 (−6.8%) |
+| 32 | 4.846 | 4.830 | −0.016 |
+| 64 | 4.858 | 4.850 | −0.007 |
+
+**Findings:**
+
+1. **Monotonic, dramatic scaling law:** the FID benefit of rejection grows smoothly as step count decreases, from ~0% at 64 steps to **−17.6%** at 8 steps. This is a clean trend across nearly an order of magnitude in step count.
+2. **At 8 and 12 steps, the gain is large enough to dwarf any sampling noise** — confidence in the effect is very high.
+3. Note: this column uses `max_prob, cap=0.2`, not the best (margin, cap=0.5). The 8/12-step numbers might improve further with the better config — open question.
+
+### Robustness
+
+**18 / 18 rejection configs at 16 steps beat vanilla.** No exceptions. The effect is robust to all (τ, cap, metric) combinations tested.
+
+### Phase 2 ranked summary (top 5 at 16 steps)
+
+| Rank | metric | τ | cap | FID | Δ |
+|------|--------|---|-----|-----|---|
+| 1 | margin | 0.5 | 0.5 | 5.424 | −0.789 |
+| 2 | max_prob | 0.7 | 0.5 | 5.451 | −0.762 |
+| 3 | max_prob | 0.3 | 0.5 | 5.451 | −0.762 |
+| 4 | max_prob | 0.5 | 0.5 | 5.451 | −0.762 |
+| 5 | max_prob | 0.5 | 0.3 | 5.583 | −0.629 |
+
+### Phase 2 synthesis
+
+The 16-step result from Phase 1b was not a fluke — it is robust, scales monotonically with regime aggressiveness, and is improvable with looser caps and the right metric (margin, not max_prob). The project now has:
+
+- **A clean compute-efficiency claim:** rejection delivers a 12.69% FID reduction at 16 steps and up to 17.6% at 8 steps.
+- **A monotonic scaling law** linking step count to rejection benefit.
+- **A surprising τ-irrelevance finding** — confidence threshold is not the right knob; rejection rate cap is.
+- **A clean negative ablation** (Phase 1b) showing intervention must happen during generation, not post-hoc.
+
+**Full results CSV:** `/content/drive/MyDrive/ARPG-assets/results/pilot-20260421/phase2-16step/16step-results.csv`
+**Combined CSV (all phases):** `/content/drive/MyDrive/ARPG-assets/results/pilot-20260421/phase2-16step/combined-results-v2.csv`
 
 ---
 
 ## Phase 3 — FID-50K Validation on Top Configs *(PENDING)*
 
 **Target date:** April 27 – May 1, 2026
-**Purpose:** Replace the 10K-sample FID estimates with paper-grade 50K-sample numbers for the top 1-3 configs identified in Phase 2.
+**Purpose:** Replace the 10K-sample FID estimates with paper-grade 50K-sample numbers, for headline numbers in the progress report.
 
-Matched-wall-clock comparison: rejection at 16 steps vs vanilla at some equivalent step count for a fair compute-vs-quality tradeoff claim.
+### Planned configs
+
+Based on Phase 2 winner ranking, the FID-50K runs to do:
+
+| # | Config | Steps | Purpose |
+|---|--------|-------|---------|
+| 1 | margin, τ=0.5, cap=0.5 | 16 | Validate the headline winner |
+| 2 | vanilla | 16 | Matched-step baseline |
+| 3 | margin, τ=0.5, cap=0.5 | 8 | Validate the ultra-aggressive regime |
+| 4 | vanilla | 8 | Matched-step baseline |
+
+Optional:
+- vanilla at 32 steps with FID-50K for the matched-quality claim (we already have vanilla at 64 with FID-50K from Phase 0)
+- margin, τ=0.5, cap=0.5 at 12 steps for the full step-count curve
+
+### Compute estimate
+
+Each config: ~2 hours for 50K samples on A100 + ~5 min FID. 4 configs → ~9 hours. Realistic to split across 2 Colab sessions over 2 days.
 
 ---
 
@@ -185,13 +265,18 @@ Deliverable for the May 3 milestone.
 
 ## Raw artefact index
 
+All paths relative to `/content/drive/MyDrive/ARPG-assets/results/`.
+
 | Location | Contents |
 |----------|----------|
-| `pilot-20260421/results.csv` on Drive | Phase 1 pilot, 19 rows (32 steps) |
-| `pilot-20260421/logs/` on Drive | Per-config rejection JSON logs + heatmaps (Phase 1) |
+| `pilot-20260421/results.csv` | Phase 1 pilot, 19 rows (32 steps) |
+| `pilot-20260421/logs/` | Per-config rejection JSON logs + heatmaps (Phase 1) |
 | `pilot-20260421/tier1-extension/tier1-results.csv` | Phase 1b, 9 rows |
 | `pilot-20260421/tier1-extension/combined-results.csv` | Merged Phase 1 + Phase 1b, 28 rows |
 | `pilot-20260421/tier1-extension/logs/` | Per-config logs + heatmaps (Phase 1b) |
+| `pilot-20260421/phase2-16step/16step-results.csv` | Phase 2, 22 rows |
+| `pilot-20260421/phase2-16step/combined-results-v2.csv` | Merged Phase 1 + 1b + 2, 49 unique rows |
+| `pilot-20260421/phase2-16step/logs/` | Per-config logs + heatmaps (Phase 2) |
 
 ---
 
@@ -205,5 +290,9 @@ Deliverable for the May 3 milestone.
 4. **[April 24]** Post-hoc refinement (K=0.1, 0.2) consistently hurts quality — intervention must happen DURING generation.
 5. **[April 24]** Rejection strongly benefits the aggressive regime: at 16 steps, FID drops 0.424 (6.212 → 5.788). At 32+ steps, the effect is indistinguishable from noise.
 6. **[April 24]** The project's primary claim is now compute-efficiency in the low-step regime, not general FID improvement at standard step counts.
-
-*(Next planned updates after the 16-step sweep.)*
+7. **[April 25]** **τ is irrelevant in the aggressive regime** — at 16 steps with max_prob, the (τ × cap) grid shows literally identical FIDs across τ ∈ {0.3, 0.5, 0.7}. The cap is binding even at cap=0.5, meaning ARPG is uncertain about more than half its parallel predictions every step at 16 steps. **The cap is the only meaningful knob.** Conclusion 2 from April 22 generalizes: τ has no effect anywhere in our explored range.
+8. **[April 25]** **The metric ranking depends on the regime.** At 32 steps and at 16 steps with low cap, max_prob is best. **At 16 steps with cap=0.5, margin overtakes max_prob** (5.424 vs 5.451). This contradicts conclusion 3 from April 22 in the high-cap regime — margin is best when the rejection rate is high. Entropy is consistently worst.
+9. **[April 25]** **Cap improves FID monotonically up through 0.5** at 16 steps. No diminishing returns visible yet. Open question: does cap > 0.5 keep helping?
+10. **[April 25]** **Rejection benefit scales monotonically with regime aggressiveness** (Block C of Phase 2). Δ vs vanilla: −0.007 at 64 steps → −0.016 at 32 → −0.424 at 16 → −0.959 at 12 → −2.346 at 8. This is the strongest scaling result in the project and directly supports the compute-efficiency narrative.
+11. **[April 25]** **The mechanism is robust across the entire (τ, cap, metric) grid at 16 steps** — 18 / 18 rejection configs beat vanilla. No exceptions in the explored space.
+12. **[April 25]** Headline result for the progress report: **margin, τ=0.5, cap=0.5 at 16 steps reduces FID-10K from 6.212 → 5.424 (−12.69%)**. Pending FID-50K validation in Phase 3.
