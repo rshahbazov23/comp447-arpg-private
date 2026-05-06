@@ -272,7 +272,8 @@ if __name__ == "__main__":
                         choices=['none', 'rejection', 'refinement'],
                         help="'none' = vanilla ARPG; 'rejection' = defer low-confidence tokens; 'refinement' = post-hoc re-decode ablation")
     parser.add_argument("--confidence-metric", type=str, default='max_prob',
-                        choices=['max_prob', 'entropy', 'margin'])
+                        choices=['max_prob', 'entropy', 'margin', 'random'],
+                        help="'random' is a control baseline: deferred subset is chosen uniformly at random rather than by confidence ranking.")
     parser.add_argument("--rejection-threshold", type=float, default=0.5,
                         help="tau: tokens with confidence below this are deferred (pilot grid: {0.3, 0.5, 0.7})")
     parser.add_argument("--max-reject-rate", type=float, default=0.2,

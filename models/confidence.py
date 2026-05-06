@@ -37,8 +37,19 @@ def margin(logits: torch.Tensor) -> torch.Tensor:
     return top2[..., 0] - top2[..., 1]
 
 
+def random_score(logits: torch.Tensor) -> torch.Tensor:
+    """Uniform random scores in [0, 1]. Control baseline: deferring by random
+    score is equivalent to deferring a uniform random subset of positions
+    (subject to the same threshold / cap logic). Used to isolate whether the
+    FID gain from rejection is due to the confidence ranking specifically
+    or merely to deferring some tokens to later, context-richer steps.
+    """
+    return torch.rand(logits.shape[:-1], device=logits.device, dtype=logits.dtype)
+
+
 CONFIDENCE_FNS = {
     "max_prob": max_prob,
     "entropy": entropy,
     "margin": margin,
+    "random": random_score,
 }
