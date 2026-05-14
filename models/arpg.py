@@ -559,6 +559,7 @@ class Transformer(nn.Module):
         num_iter=64,
         threshold: float = 0.5,
         max_reject_rate: float = 0.2,
+        max_reject_rate_end: Optional[float] = None,
         confidence_metric: str = 'max_prob',
         tracker=None,
         generator: Optional[torch.Generator] = None,
@@ -570,6 +571,11 @@ class Transformer(nn.Module):
         below `threshold` are deferred (not committed to the KV cache) and get
         re-attempted in a later step with more context. The `max_reject_rate`
         parameter caps rejections per step.
+
+        Step-varying cap: if `max_reject_rate_end` is provided, the per-step cap
+        linearly interpolates from `max_reject_rate` (start, step 0) to
+        `max_reject_rate_end` (end, step num_iter-1). With `max_reject_rate_end=None`
+        the cap is constant — bit-identical to the prior single-cap behaviour.
 
         Threshold=0 with max_reject_rate=0 must produce output IDENTICAL to
         generate() with the same generator (parity test).
@@ -668,7 +674,13 @@ class Transformer(nn.Module):
                 accept_mask_col = torch.ones(num_pred, dtype=torch.bool, device=device)
                 num_accepted = num_pred
             else:
-                min_accept = int(math.ceil((1.0 - max_reject_rate) * num_pred))
+                # Step-varying cap: linearly interpolate if max_reject_rate_end is set.
+                if max_reject_rate_end is None:
+                    current_cap = max_reject_rate
+                else:
+                    t = step / max(1, num_iter - 1)
+                    current_cap = max_reject_rate * (1.0 - t) + max_reject_rate_end * t
+                min_accept = int(math.ceil((1.0 - current_cap) * num_pred))
                 if min_accept >= num_pred:
                     # Cap forces every token to be accepted → short-circuit to avoid one sync.
                     accept_mask_col = torch.ones(num_pred, dtype=torch.bool, device=device)
@@ -713,7 +725,8 @@ class Transformer(nn.Module):
                 # override. Guard as a hard failure.
                 raise RuntimeError(
                     f"step {step}: zero tokens accepted; cache cannot progress. "
-                    f"Check threshold={threshold} and max_reject_rate={max_reject_rate}."
+                    f"Check threshold={threshold}, max_reject_rate={max_reject_rate}, "
+                    f"max_reject_rate_end={max_reject_rate_end}."
                 )
 
             sequences.append(accepted_tokens)

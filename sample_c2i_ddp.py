@@ -120,6 +120,8 @@ def main(args):
             f"-mode-rejection-metric-{args.confidence_metric}"
             f"-tau-{args.rejection_threshold}-cap-{args.max_reject_rate}"
         )
+        if args.max_reject_rate_end is not None:
+            folder_name += f"-capend-{args.max_reject_rate_end}"
     elif args.rejection_mode == 'refinement':
         folder_name += (
             f"-mode-refinement-metric-{args.confidence_metric}-k-{args.refinement_k}"
@@ -185,6 +187,7 @@ def main(args):
                 sample_schedule=args.sample_schedule,
                 threshold=args.rejection_threshold,
                 max_reject_rate=args.max_reject_rate,
+                max_reject_rate_end=args.max_reject_rate_end,
                 confidence_metric=args.confidence_metric,
                 tracker=tracker,
                 debug=args.debug,
@@ -278,6 +281,9 @@ if __name__ == "__main__":
                         help="tau: tokens with confidence below this are deferred (pilot grid: {0.3, 0.5, 0.7})")
     parser.add_argument("--max-reject-rate", type=float, default=0.2,
                         help="max fraction of tokens that can be deferred per step (pilot grid: {0.1, 0.2})")
+    parser.add_argument("--max-reject-rate-end", type=float, default=None,
+                        help="If set, cap linearly decays from --max-reject-rate (start) to "
+                             "--max-reject-rate-end (end) across decoding steps. None = constant cap.")
     parser.add_argument("--refinement-k", type=float, default=0.1,
                         help="fraction of lowest-confidence tokens to re-decode (ablation grid: {0.1, 0.2})")
     parser.add_argument("--debug", action='store_true',
